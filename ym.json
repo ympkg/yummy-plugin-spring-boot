@@ -1,6 +1,6 @@
 {
   "name": "yummy-plugin-spring-boot",
-  "version": "4.0.3-5",
+  "version": "4.0.3-7",
   "target": "25",
   "groupId": "sh.yummy",
   "dependencies": {
