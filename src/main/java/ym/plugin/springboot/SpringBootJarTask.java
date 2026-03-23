@@ -25,6 +25,9 @@ import java.util.zip.*;
  */
 public class SpringBootJarTask {
 
+    private static final String YM_DIR = ".ym";
+    private static final String MAVEN_CACHE_DIR = "maven";
+
     private final SpringBootExtension config;
     private final Set<String> writtenEntries = new HashSet<>();
 
@@ -89,12 +92,28 @@ public class SpringBootJarTask {
                 addDirectoryToJar(zos, resourcesDir, "BOOT-INF/classes/");
             }
 
-            // 5. BOOT-INF/lib/ — all dependency JARs (workspace thin JARs + external JARs)
-            // Workspace modules are pre-packaged as thin JARs by ym (like Gradle's jar task).
-            // No directory deps — everything is a JAR to avoid duplication.
+            // 5. BOOT-INF/lib/ — all dependency JARs + workspace module directories
+            // Runtime classpath contains both:
+            //   - JAR files (external dependencies from Maven cache)
+            //   - Directories (workspace modules compiled by ym to out/classes/)
+            // For directories: package them into a JAR on-the-fly, then add as STORED.
+            // This matches Spring Boot Gradle plugin behavior.
             var classpathEntries = new ArrayList<String>();
+            System.err.println("[spring-boot] Runtime classpath (" + runtimeJars.size() + " entries):");
+            for (var p : runtimeJars) {
+                System.err.println("[spring-boot]   " + (Files.isDirectory(p) ? "DIR " : "JAR ") + p);
+            }
             for (var jar : runtimeJars) {
-                if (!Files.exists(jar) || Files.isDirectory(jar)) continue;
+                if (!Files.exists(jar)) continue;
+
+                if (Files.isDirectory(jar)) {
+                    // Workspace module directory — package as a JAR
+                    var dirName = inferModuleName(jar);
+                    var entryName = "BOOT-INF/lib/" + dirName + ".jar";
+                    addDirectoryAsStoredJar(zos, jar, entryName);
+                    classpathEntries.add("- \"" + entryName + "\"");
+                    continue;
+                }
 
                 var jarFileName = jar.getFileName().toString();
                 if (!jarFileName.endsWith(".jar")) continue;
@@ -102,6 +121,8 @@ public class SpringBootJarTask {
                 if (jarFileName.contains("spring-boot-loader") && !jarFileName.contains("tools")) continue;
                 // Exclude plugin JARs
                 if (jarFileName.contains("yummy-plugin")) continue;
+                // Exclude empty thin JARs (workspace modules already handled as directories)
+                if (jarFileName.contains(".thin.") && Files.size(jar) < 100) continue;
 
                 var entryName = "BOOT-INF/lib/" + jarFileName;
                 addStoredJar(zos, jar, entryName);
@@ -253,6 +274,73 @@ public class SpringBootJarTask {
     }
 
     /**
+     * Package a directory (workspace module classes + resources) into a STORED JAR entry.
+     * Creates an in-memory JAR from the directory tree, then writes it as a STORED entry
+     * so Spring Boot's NestedJarFile can read it.
+     */
+    private void addDirectoryAsStoredJar(ZipOutputStream zos, Path dir, String entryName) throws IOException {
+        var baos = new ByteArrayOutputStream();
+        try (var jarOs = new JarOutputStream(baos)) {
+            Files.walkFileTree(dir, new SimpleFileVisitor<>() {
+                @Override
+                public FileVisitResult preVisitDirectory(Path d, BasicFileAttributes attrs) throws IOException {
+                    if (!d.equals(dir)) {
+                        var relative = dir.relativize(d).toString().replace('\\', '/') + "/";
+                        var dirEntry = new ZipEntry(relative);
+                        jarOs.putNextEntry(dirEntry);
+                        jarOs.closeEntry();
+                    }
+                    return FileVisitResult.CONTINUE;
+                }
+
+                @Override
+                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                    var relative = dir.relativize(file).toString().replace('\\', '/');
+                    var fileEntry = new ZipEntry(relative);
+                    jarOs.putNextEntry(fileEntry);
+                    Files.copy(file, jarOs);
+                    jarOs.closeEntry();
+                    return FileVisitResult.CONTINUE;
+                }
+            });
+        }
+
+        var data = baos.toByteArray();
+        var entry = new ZipEntry(entryName);
+        entry.setMethod(ZipEntry.STORED);
+        entry.setSize(data.length);
+        entry.setCompressedSize(data.length);
+        var crc = new CRC32();
+        crc.update(data);
+        entry.setCrc(crc.getValue());
+
+        writtenEntries.add(entryName);
+        zos.putNextEntry(entry);
+        zos.write(data);
+        zos.closeEntry();
+    }
+
+    /**
+     * Infer a module name from a workspace module's classes directory path.
+     * E.g., /path/to/libs/core/omnirepo-auth/out/classes → omnirepo-auth
+     */
+    private String inferModuleName(Path classesDir) {
+        // Walk up from "out/classes" to find the module directory
+        var current = classesDir;
+        for (int i = 0; i < 5 && current != null; i++) {
+            if (current.getFileName() != null && current.getFileName().toString().equals("out")) {
+                var parent = current.getParent();
+                if (parent != null && parent.getFileName() != null) {
+                    return parent.getFileName().toString();
+                }
+            }
+            current = current.getParent();
+        }
+        // Fallback: use the directory name itself
+        return classesDir.getFileName().toString();
+    }
+
+    /**
      * Find spring-boot-loader JAR from classpath or ym Maven cache.
      * Loader is declared as a dependency of this plugin, resolved by ym.
      */
@@ -264,7 +352,7 @@ public class SpringBootJarTask {
             }
         }
         var home = System.getProperty("user.home", ".");
-        var cached = Path.of(home, ".ym", "caches",
+        var cached = Path.of(home, YM_DIR, MAVEN_CACHE_DIR,
                 "org.springframework.boot", "spring-boot-loader", version,
                 "spring-boot-loader-" + version + ".jar");
         if (Files.exists(cached)) return cached;
